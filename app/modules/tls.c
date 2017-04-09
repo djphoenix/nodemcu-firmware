@@ -1,8 +1,12 @@
 // Module for TLS
 
-#include "module.h"
+#include "user_config.h"
 
-#if defined(CLIENT_SSL_ENABLE) && defined(LUA_USE_MODULES_NET)
+#ifdef CLIENT_SSL_ENABLE
+#define LUA_USE_MODULES_TLS
+#endif
+
+#include "module.h"
 
 #include "lauxlib.h"
 #include "platform.h"
@@ -646,4 +650,3 @@ int luaopen_tls( lua_State *L ) {
 }
 
 NODEMCU_MODULE(TLS, "tls", tls_map, luaopen_tls);
-#endif
