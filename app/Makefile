@@ -49,6 +49,7 @@ SUBDIRS= 					\
 	swTimer					\
 	misc					\
 	pm						\
+	tlswrap       \
 	
 
 endif # } PDIR
@@ -102,6 +103,7 @@ COMPONENTS_eagle.app.v6 = 			\
 	modules/libmodules.a			\
 	swTimer/libswtimer.a			\
 	misc/libmisc.a					\
+	tlswrap/libtlswrap.a       \
 	
 
 # Inspect the modules library and work out which modules need to be linked.

@@ -18,7 +18,7 @@
 #include "c_types.h"
 #include "mem.h"
 #include "lwip/ip_addr.h"
-#include "espconn.h"
+#include "../tlswrap/tlswrap.h"
 #include "lwip/err.h"
 #include "lwip/dns.h"
 
@@ -31,373 +31,346 @@ __attribute__((section(".servercert.flash"))) unsigned char tls_server_cert_area
 __attribute__((section(".clientcert.flash"))) unsigned char tls_client_cert_area[INTERNAL_FLASH_SECTOR_SIZE];
 
 extern int tls_socket_create( lua_State *L );
+extern int lwip_lua_checkerr (lua_State *L, err_t err);
 extern const LUA_REG_TYPE tls_cert_map[];
 
 typedef struct {
-  struct espconn *pesp_conn;
   int self_ref;
-  int cb_connect_ref;
-  int cb_reconnect_ref;
-  int cb_disconnect_ref;
-  int cb_sent_ref;
-  int cb_receive_ref;
+  struct tls_pcb *pcb;
+  int wait_dns;
   int cb_dns_ref;
+  int cb_receive_ref;
+  int cb_sent_ref;
+  // Only for TCP:
+  int hold;
+  int cb_connect_ref;
+  int cb_disconnect_ref;
+  int cb_reconnect_ref;
 } tls_socket_ud;
 
-int tls_socket_create( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud*) lua_newuserdata(L, sizeof(tls_socket_ud));
-
-  ud->pesp_conn = NULL;
-  ud->self_ref =
-  ud->cb_connect_ref =
-  ud->cb_reconnect_ref =
-  ud->cb_disconnect_ref =
-  ud->cb_sent_ref =
-  ud->cb_receive_ref =
-  ud->cb_dns_ref = LUA_NOREF;
-
-  luaL_getmetatable(L, "tls.socket");
-  lua_setmetatable(L, -2);
-
-  return 1;
-}
-
-static void tls_socket_onconnect( struct espconn *pesp_conn ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn->reverse;
+static void tls_err_cb(void *arg, err_t err) {
+  tls_socket_ud *ud = (tls_socket_ud*)arg;
   if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_connect_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    lua_call(L, 1, 0);
-  }
-}
-
-static void tls_socket_cleanup(tls_socket_ud *ud) {
-  if (ud->pesp_conn) {
-    espconn_secure_disconnect(ud->pesp_conn);
-    if (ud->pesp_conn->proto.tcp) {
-      c_free(ud->pesp_conn->proto.tcp);
-      ud->pesp_conn->proto.tcp = NULL;
-    }
-    c_free(ud->pesp_conn);
-    ud->pesp_conn = NULL;
-  }
+  ud->pcb = NULL; // Will be freed at LWIP level
   lua_State *L = lua_getstate();
-  lua_gc(L, LUA_GCSTOP, 0);
-  luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
-  ud->self_ref = LUA_NOREF;
-  lua_gc(L, LUA_GCRESTART, 0);
-}
-
-static void tls_socket_ondisconnect( struct espconn *pesp_conn ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn->reverse;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  tls_socket_cleanup(ud);
-  if (ud->cb_disconnect_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_disconnect_ref);
+  int ref;
+  if (err != ERR_OK && ud->cb_reconnect_ref != LUA_NOREF)
+    ref = ud->cb_reconnect_ref;
+  else ref = ud->cb_disconnect_ref;
+  if (ref != LUA_NOREF) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    tls_socket_cleanup(ud);
-    lua_call(L, 1, 0);
-  } else tls_socket_cleanup(ud);
-}
-
-static void tls_socket_onreconnect( struct espconn *pesp_conn, s8 err ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn->reverse;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_reconnect_ref != LUA_NOREF) {
-    const char* reason = NULL;
-    switch (err) {
-      case(ESPCONN_MEM): reason = "Out of memory"; break;
-      case(ESPCONN_TIMEOUT): reason = "Timeout"; break;
-      case(ESPCONN_RTE): reason = "Routing problem"; break;
-      case(ESPCONN_ABRT): reason = "Connection aborted"; break;
-      case(ESPCONN_RST): reason = "Connection reset"; break;
-      case(ESPCONN_CLSD): reason = "Connection closed"; break;
-      case(ESPCONN_HANDSHAKE): reason = "SSL handshake failed"; break;
-      case(ESPCONN_SSL_INVALID_DATA): reason = "SSL application invalid"; break;
-    }
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_reconnect_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    if (reason != NULL) {
-      lua_pushstring(L, reason);
-    } else {
-      lua_pushnil(L);
-    }
-    tls_socket_cleanup(ud);
-    lua_call(L, 2, 0);
-  } else tls_socket_cleanup(ud);
-}
-
-static void tls_socket_onrecv( struct espconn *pesp_conn, char *buf, u16 length ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn->reverse;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_receive_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_receive_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    lua_pushlstring(L, buf, length);
+    lua_pushinteger(L, err);
     lua_call(L, 2, 0);
   }
-}
-
-static void tls_socket_onsent( struct espconn *pesp_conn ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn->reverse;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_sent_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    lua_call(L, 1, 0);
-  }
-}
-
-static void tls_socket_dns_cb( const char* domain, const ip_addr_t *ip_addr, tls_socket_ud *ud ) {
-  if (ud->self_ref == LUA_NOREF) return;
-  ip_addr_t addr;
-  if (ip_addr) addr = *ip_addr;
-  else addr.addr = 0xFFFFFFFF;
-  lua_State *L = lua_getstate();
-  if (ud->cb_dns_ref != LUA_NOREF) {
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_dns_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    if (addr.addr == 0xFFFFFFFF) {
-      lua_pushnil(L);
-    } else {
-      char tmp[20];
-      c_sprintf(tmp, IPSTR, IP2STR(&addr.addr));
-      lua_pushstring(L, tmp);
-    }
-    lua_call(L, 2, 0);
-  }
-  if (addr.addr == 0xFFFFFFFF) {
+  if (ud->wait_dns == 0) {
     lua_gc(L, LUA_GCSTOP, 0);
     luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
     ud->self_ref = LUA_NOREF;
     lua_gc(L, LUA_GCRESTART, 0);
-  } else {
-    os_memcpy(ud->pesp_conn->proto.tcp->remote_ip, &addr.addr, 4);
-    espconn_secure_connect(ud->pesp_conn);
   }
 }
 
-static int tls_socket_connect( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
+static err_t tls_connected_cb(void *arg, struct tls_pcb *tpcb, err_t err) {
+  tls_socket_ud *ud = (tls_socket_ud*)arg;
+  if (!ud || ud->pcb != tpcb) return ERR_ABRT;
+  if (err != ERR_OK) {
+    tls_err_cb(arg, err);
+    return ERR_ABRT;
   }
-
-  if (ud->pesp_conn) {
-    return luaL_error(L, "already connected");
+  lua_State *L = lua_getstate();
+  if (ud->self_ref != LUA_NOREF && ud->cb_connect_ref != LUA_NOREF) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
+    lua_call(L, 1, 0);
   }
+  return ERR_OK;
+}
 
-  u16 port = luaL_checkinteger( L, 2 );
-  size_t il;
-  const char *domain = "127.0.0.1";
-  if( lua_isstring(L, 3) )
-    domain = luaL_checklstring( L, 3, &il );
-  if (port == 0)
-    return luaL_error(L, "invalid port");
-  if (domain == NULL)
-    return luaL_error(L, "invalid domain");
-
-  ud->pesp_conn = (struct espconn*)c_zalloc(sizeof(struct espconn));
-  if(!ud->pesp_conn)
-    return luaL_error(L, "not enough memory");
-  ud->pesp_conn->proto.udp = NULL;
-  ud->pesp_conn->proto.tcp = (esp_tcp *)c_zalloc(sizeof(esp_tcp));
-  if(!ud->pesp_conn->proto.tcp){
-    c_free(ud->pesp_conn);
-    ud->pesp_conn = NULL;
-    return luaL_error(L, "not enough memory");
-  }
-  ud->pesp_conn->type = ESPCONN_TCP;
-  ud->pesp_conn->state = ESPCONN_NONE;
-  ud->pesp_conn->reverse = ud;
-  ud->pesp_conn->proto.tcp->remote_port = port;
-  espconn_regist_connectcb(ud->pesp_conn, (espconn_connect_callback)tls_socket_onconnect);
-  espconn_regist_disconcb(ud->pesp_conn, (espconn_connect_callback)tls_socket_ondisconnect);
-  espconn_regist_reconcb(ud->pesp_conn, (espconn_reconnect_callback)tls_socket_onreconnect);
-  espconn_regist_recvcb(ud->pesp_conn, (espconn_recv_callback)tls_socket_onrecv);
-  espconn_regist_sentcb(ud->pesp_conn, (espconn_sent_callback)tls_socket_onsent);
-
-  if (ud->self_ref == LUA_NOREF) {
-    lua_pushvalue(L, 1);  // copy to the top of stack
-    ud->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  }
-
+static void tls_dns_cb(const char *name, ip_addr_t *ipaddr, void *arg) {
   ip_addr_t addr;
-  err_t err = dns_gethostbyname(domain, &addr, (dns_found_callback)tls_socket_dns_cb, ud);
-  if (err == ERR_OK) {
-    tls_socket_dns_cb(domain, &addr, ud);
-  } else if (err != ERR_INPROGRESS) {
-    tls_socket_dns_cb(domain, NULL, ud);
+  if (ipaddr != NULL) addr = *ipaddr;
+  else addr.addr = 0xFFFFFFFF;
+  tls_socket_ud *ud = (tls_socket_ud*)arg;
+  if (!ud) return;
+  lua_State *L = lua_getstate();
+  if (ud->self_ref != LUA_NOREF && ud->cb_dns_ref != LUA_NOREF) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_dns_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
+    if (addr.addr != 0xFFFFFFFF) {
+      char iptmp[16];
+      bzero(iptmp, 16);
+      ets_sprintf(iptmp, IPSTR, IP2STR(&addr.addr));
+      lua_pushstring(L, iptmp);
+    } else {
+      lua_pushnil(L);
+    }
+    lua_call(L, 2, 0);
   }
-
-  return 0;
+  ud->wait_dns --;
+  struct tcp_pcb *rawpcb = tls_getraw(ud->pcb);
+  if (ud->pcb && rawpcb->state == CLOSED) {
+    tls_connect(ud->pcb, &addr, rawpcb->remote_port, tls_connected_cb);
+  } else if (!ud->pcb && ud->wait_dns == 0) {
+    lua_gc(L, LUA_GCSTOP, 0);
+    luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
+    ud->self_ref = LUA_NOREF;
+    lua_gc(L, LUA_GCRESTART, 0);
+  }
 }
 
-static int tls_socket_on( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
+static err_t tls_recv_cb(void *arg, struct tls_pcb *tpcb, struct pbuf *p, err_t err) {
+  tls_socket_ud *ud = (tls_socket_ud*)arg;
+  if (!ud || !ud->pcb || ud->self_ref == LUA_NOREF)
+    return ERR_ABRT;
+  if (!p) {
+    tls_err_cb(arg, err);
+    return tls_close(tpcb);
   }
+  if (ud->cb_receive_ref != LUA_NOREF) {
+    lua_State *L = lua_getstate();
+    int num_args = 2;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_receive_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
+    lua_pushlstring(L, p->payload, p->len);
+    lua_call(L, num_args, 0);
+  }
+  pbuf_free(p);
+  tls_recved(tpcb, ud->hold ? 0 : TCP_WND);
+  return ERR_OK;
+}
 
-  size_t sl;
-  const char *method = luaL_checklstring( L, 2, &sl );
-  if (method == NULL)
-    return luaL_error( L, "wrong arg type" );
+static err_t tls_sent_cb(void *arg, struct tls_pcb *tpcb, u16_t len) {
+  tls_socket_ud *ud = (tls_socket_ud*)arg;
+  if (!ud || !ud->pcb || ud->self_ref == LUA_NOREF) return ERR_ABRT;
+  if (ud->cb_sent_ref == LUA_NOREF) return ERR_OK;
+  lua_State *L = lua_getstate();
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
+  lua_call(L, 1, 0);
+  return ERR_OK;
+}
 
-  luaL_checkanyfunction(L, 3);
-  lua_pushvalue(L, 3);  // copy argument (func) to the top of stack
+int tls_socket_create( lua_State *L ) {
+  tls_socket_ud *ud = (tls_socket_ud*) lua_newuserdata(L, sizeof(tls_socket_ud));
+  luaL_getmetatable(L, "tls.socket");
+  lua_setmetatable(L, -2);
 
-  if (strcmp(method, "connection") == 0) {
+  ud->self_ref = LUA_NOREF;
+  ud->pcb = NULL;
+
+  ud->cb_connect_ref = LUA_NOREF;
+  ud->cb_reconnect_ref = LUA_NOREF;
+  ud->cb_disconnect_ref = LUA_NOREF;
+  ud->hold = 0;
+  ud->wait_dns = 0;
+  ud->cb_dns_ref = LUA_NOREF;
+  ud->cb_receive_ref = LUA_NOREF;
+  ud->cb_sent_ref = LUA_NOREF;
+
+  return 1;
+}
+
+int tls_socket_connect( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (ud->pcb)
+    return luaL_error(L, "already connected");
+  uint16_t port = luaL_checkinteger(L, 2);
+  if (port == 0)
+    return luaL_error(L, "specify port");
+  const char *domain = "127.0.0.1";
+  if (lua_isstring(L, 3)) {
+    size_t dl = 0;
+    domain = luaL_checklstring(L, 3, &dl);
+  }
+  if (lua_gettop(L) > 3) {
+    luaL_argcheck(L, lua_isfunction(L, 4) || lua_islightfunction(L, 4), 4, "not a function");
+    lua_pushvalue(L, 4);
     luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
     ud->cb_connect_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else if (strcmp(method, "disconnection") == 0) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_disconnect_ref);
-    ud->cb_disconnect_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else if (strcmp(method, "reconnection") == 0) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_reconnect_ref);
-    ud->cb_reconnect_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else if (strcmp(method, "receive") == 0) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_receive_ref);
-    ud->cb_receive_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else if (strcmp(method, "sent") == 0) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
-    ud->cb_sent_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  } else if (strcmp(method, "dns") == 0) {
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_dns_ref);
-    ud->cb_dns_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
+  ud->pcb = tls_new();
+  if (!ud->pcb)
+    return luaL_error(L, "cannot allocate PCB");
+  tls_arg(ud->pcb, ud);
+  tls_err(ud->pcb, tls_err_cb);
+  tls_recv(ud->pcb, tls_recv_cb);
+  tls_sent(ud->pcb, tls_sent_cb);
+  tls_getraw(ud->pcb)->remote_port = port;
+  tls_hostname(ud->pcb, domain);
+  ip_addr_t addr;
+  ud->wait_dns ++;
+  int unref = 0;
+  if (ud->self_ref == LUA_NOREF) {
+    unref = 1;
+    lua_pushvalue(L, 1);
+    ud->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
+  err_t err = dns_gethostbyname(domain, &addr, tls_dns_cb, ud);
+  if (err == ERR_OK) {
+    tls_dns_cb(domain, &addr, ud);
+  } else if (err != ERR_INPROGRESS) {
+    ud->wait_dns --;
+    if (unref) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
+      ud->self_ref = LUA_NOREF;
+    }
+    tls_abort(ud->pcb);
+    ud->pcb = NULL;
+    return lwip_lua_checkerr(L, err);
+  }
+  return 0;
+}
+
+int tls_socket_on( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  int *refptr = NULL;
+  const char *name = luaL_checkstring(L, 2);
+  if (!name) return luaL_error(L, "need callback name");
+  if (strcmp("connection",name)==0) { refptr = &ud->cb_connect_ref; }
+  if (strcmp("disconnection",name)==0) { refptr = &ud->cb_disconnect_ref; }
+  if (strcmp("reconnection",name)==0) { refptr = &ud->cb_reconnect_ref; }
+  if (strcmp("dns",name)==0) { refptr = &ud->cb_dns_ref; }
+  if (strcmp("receive",name)==0) { refptr = &ud->cb_receive_ref; }
+  if (strcmp("sent",name)==0) { refptr = &ud->cb_sent_ref; }
+  if (refptr == NULL)
+    return luaL_error(L, "invalid callback name");
+  if (lua_isfunction(L, 3) || lua_islightfunction(L, 3)) {
+    lua_pushvalue(L, 3);
+    luaL_unref(L, LUA_REGISTRYINDEX, *refptr);
+    *refptr = luaL_ref(L, LUA_REGISTRYINDEX);
+  } else if (lua_isnil(L, 3)) {
+    luaL_unref(L, LUA_REGISTRYINDEX, *refptr);
+    *refptr = LUA_NOREF;
   } else {
-    return luaL_error(L, "invalid method");
+    return luaL_error(L, "invalid callback function");
   }
   return 0;
 }
 
-static int tls_socket_send( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
+int tls_socket_hold( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (!ud->hold && ud->pcb) {
+    ud->hold = 1;
   }
-
-  if(ud->pesp_conn == NULL) {
-    NODE_DBG("not connected");
-    return 0;
-  }
-
-  size_t sl;
-  const char* buf = luaL_checklstring(L, 2, &sl);
-  if (!buf) {
-    return luaL_error(L, "wrong arg type");
-  }
-
-  espconn_secure_send(ud->pesp_conn, (void*)buf, sl);
-
   return 0;
 }
-static int tls_socket_hold( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
+
+int tls_socket_unhold( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (ud->hold && ud->pcb) {
+    ud->hold = 0;
+    tls_getraw(ud->pcb)->flags |= TF_ACK_NOW;
+    tls_recved(ud->pcb, TCP_WND);
   }
-
-  if(ud->pesp_conn == NULL) {
-    NODE_DBG("not connected");
-    return 0;
-  }
-
-  espconn_recv_hold(ud->pesp_conn);
-
   return 0;
 }
-static int tls_socket_unhold( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
-  }
 
-  if(ud->pesp_conn == NULL) {
-    NODE_DBG("not connected");
-    return 0;
+int tls_socket_getpeer( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (!ud->pcb) {
+    lua_pushnil(L);
+    lua_pushnil(L);
+    return 2;
   }
-
-  espconn_recv_unhold(ud->pesp_conn);
-
-  return 0;
-}
-static int tls_socket_dns( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
+  struct tcp_pcb *rawpcb = tls_getraw(ud->pcb);
+  uint16_t port = rawpcb->remote_port;
+  ip_addr_t addr = rawpcb->remote_ip;
+  if (port == 0) {
+    lua_pushnil(L);
+    lua_pushnil(L);
+    return 2;
   }
-
-  return 0;
-}
-static int tls_socket_getpeer( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
-  }
-
-  if(ud->pesp_conn && ud->pesp_conn->proto.tcp->remote_port != 0){
-    char temp[20] = {0};
-    c_sprintf(temp, IPSTR, IP2STR( &(ud->pesp_conn->proto.tcp->remote_ip) ) );
-    lua_pushstring( L, temp );
-    lua_pushinteger( L, ud->pesp_conn->proto.tcp->remote_port );
-  } else {
-    lua_pushnil( L );
-    lua_pushnil( L );
-  }
+  char addr_str[16];
+  bzero(addr_str, 16);
+  ets_sprintf(addr_str, IPSTR, IP2STR(&addr.addr));
+  lua_pushinteger(L, port);
+  lua_pushstring(L, addr_str);
   return 2;
 }
-static int tls_socket_close( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
-  }
 
-  if (ud->pesp_conn) {
-    espconn_secure_disconnect(ud->pesp_conn);
+int tls_socket_dns( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  size_t dl = 0;
+  const char *domain = luaL_checklstring(L, 2, &dl);
+  if (!domain)
+    return luaL_error(L, "no domain specified");
+  if (lua_isfunction(L, 3) || lua_islightfunction(L, 3)) {
+    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_dns_ref);
+    lua_pushvalue(L, 3);
+    ud->cb_dns_ref = luaL_ref(L, LUA_REGISTRYINDEX);
   }
-
+  if (ud->cb_dns_ref == LUA_NOREF)
+    return luaL_error(L, "no callback specified");
+  ud->wait_dns ++;
+  int unref = 0;
+  if (ud->self_ref == LUA_NOREF) {
+    unref = 1;
+    lua_pushvalue(L, 1);
+    ud->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
+  ip_addr_t addr;
+  err_t err = dns_gethostbyname(domain, &addr, tls_dns_cb, ud);
+  if (err == ERR_OK) {
+    tls_dns_cb(domain, &addr, ud);
+  } else if (err != ERR_INPROGRESS) {
+    ud->wait_dns --;
+    if (unref) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
+      ud->self_ref = LUA_NOREF;
+    }
+    return lwip_lua_checkerr(L, err);
+  }
   return 0;
 }
-static int tls_socket_delete( lua_State *L ) {
-  tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
-  if(ud==NULL){
-  	NODE_DBG("userdata is nil.\n");
-  	return 0;
-  }
-  if (ud->pesp_conn) {
-    espconn_secure_disconnect(ud->pesp_conn);
-    if (ud->pesp_conn->proto.tcp) {
-      c_free(ud->pesp_conn->proto.tcp);
-      ud->pesp_conn->proto.tcp = NULL;
-    }
-    c_free(ud->pesp_conn);
-    ud->pesp_conn = NULL;
-  }
 
+int tls_socket_send( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  ip_addr_t addr;
+  uint16_t port;
+  const char *data;
+  size_t datalen = 0;
+  int stack = 2;
+  data = luaL_checklstring(L, stack++, &datalen);
+  if (!data || datalen == 0) return luaL_error(L, "no data to send");
+  if (lua_isfunction(L, stack) || lua_islightfunction(L, stack)) {
+    lua_pushvalue(L, stack++);
+    luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
+    ud->cb_sent_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
+  if (!ud->pcb || ud->self_ref == LUA_NOREF)
+    return luaL_error(L, "not connected");
+  err_t err = tls_write(ud->pcb, data, datalen, TCP_WRITE_FLAG_COPY);
+  return lwip_lua_checkerr(L, err);
+}
+
+int tls_socket_close( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (ud->pcb) {
+    if (ERR_OK != tls_close(ud->pcb)) {
+      tls_arg(ud->pcb, NULL);
+      tls_abort(ud->pcb);
+    }
+    ud->pcb = NULL;
+  } else {
+    return luaL_error(L, "not connected");
+  }
+  if (ud->pcb == NULL && ud->wait_dns == 0) {
+    lua_gc(L, LUA_GCSTOP, 0);
+    luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
+    ud->self_ref = LUA_NOREF;
+    lua_gc(L, LUA_GCRESTART, 0);
+  }
+  return 0;
+}
+
+int tls_socket_delete( lua_State *L ) {
+  tls_socket_ud *ud = luaL_checkudata(L, 1, "tls.socket");
+  if (ud->pcb) {
+    tls_arg(ud->pcb, NULL);
+    tls_abort(ud->pcb);
+    ud->pcb = NULL;
+  }
   luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
   ud->cb_connect_ref = LUA_NOREF;
   luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_disconnect_ref);
@@ -415,9 +388,9 @@ static int tls_socket_delete( lua_State *L ) {
   luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
   ud->self_ref = LUA_NOREF;
   lua_gc(L, LUA_GCRESTART, 0);
-
   return 0;
 }
+
 
 // Returns NULL on success, error message otherwise
 static const char *append_pem_blob(const char *pem, const char *type, uint8_t **buffer_p, uint8_t *buffer_limit, const char *name) {
@@ -565,9 +538,9 @@ static int tls_cert_auth(lua_State *L)
     if (tls_client_cert_area[0] == 0x00 || tls_client_cert_area[0] == 0xff) {
       return luaL_error( L, "no certificates found" );
     }
-    rc = espconn_secure_cert_req_enable(1, flash_offset / INTERNAL_FLASH_SECTOR_SIZE);
+//    rc = espconn_secure_cert_req_enable(1, flash_offset / INTERNAL_FLASH_SECTOR_SIZE);
   } else {
-    rc = espconn_secure_cert_req_disable(1);
+//    rc = espconn_secure_cert_req_disable(1);
   }
 
   lua_pushboolean(L, rc);
@@ -606,9 +579,9 @@ static int tls_cert_verify(lua_State *L)
     if (tls_server_cert_area[0] == 0x00 || tls_server_cert_area[0] == 0xff) {
       return luaL_error( L, "no certificates found" );
     }
-    rc = espconn_secure_ca_enable(1, flash_offset / INTERNAL_FLASH_SECTOR_SIZE);
+//    rc = espconn_secure_ca_enable(1, flash_offset / INTERNAL_FLASH_SECTOR_SIZE);
   } else {
-    rc = espconn_secure_ca_disable(1);
+//    rc = espconn_secure_ca_disable(1);
   }
 
   lua_pushboolean(L, rc);
@@ -645,7 +618,6 @@ static const LUA_REG_TYPE tls_map[] = {
 
 int luaopen_tls( lua_State *L ) {
   luaL_rometatable(L, "tls.socket", (void *)tls_socket_map);  // create metatable for net.server
-  espconn_secure_set_size(ESPCONN_CLIENT, 4096);
   return 0;
 }
 
